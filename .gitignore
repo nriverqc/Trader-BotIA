@@ -1,0 +1,16 @@
+# .gitignore
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.db
+*.sqlite
+.env
+secrets.env
+*.png
+learning_report.json
+optimized_params.json
+strategy_params.json
+optimization_history.json
+.vscode/
+.idea/

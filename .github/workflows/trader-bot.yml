@@ -1,0 +1,206 @@
+name: Trader Bot - Automated Learning
+
+on:
+  schedule:
+    # Ejecutar cada 4 horas (más frecuente para aprendizaje)
+    - cron: '0 */4 * * *'
+  workflow_dispatch:  # Permite ejecución manual
+
+jobs:
+  learn-and-trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45  # Máximo 45 minutos por ejecución
+    
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: traderbot
+          POSTGRES_PASSWORD: bot123456
+          POSTGRES_DB: traderdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev
+        
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Create environment configuration
+      run: |
+        # Crear carpeta config si no existe
+        mkdir -p config
+        
+        # Crear archivo de configuración mínimo
+        cat > config/settings.py << 'EOF'
+        # Configuración para GitHub Actions
+        import os
+        
+        DB_CONFIG = {
+            'host': 'localhost',
+            'port': 5432,
+            'user': 'traderbot',
+            'password': 'bot123456',
+            'database': 'traderdb'
+        }
+        
+        # BingX configuration (demo mode)
+        BINGX_CONFIG = {
+            'api_key': os.getenv('BINGX_API_KEY', ''),
+            'api_secret': os.getenv('BINGX_SECRET_KEY', ''),
+            'sandbox': True  # Usar sandbox en GitHub Actions
+        }
+        
+        TRADING_CONFIG = {
+            'symbol': 'BTC/USDT:USDT',
+            'interval_seconds': 300,  # 5 minutos en GitHub Actions
+            'max_trades_per_run': 5
+        }
+        EOF
+        
+        echo "✅ Configuration files created"
+        
+    - name: Wait for PostgreSQL to be ready
+      run: |
+        for i in {1..10}; do
+          if pg_isready -h localhost -p 5432; then
+            echo "✅ PostgreSQL is ready"
+            break
+          fi
+          echo "⏳ Waiting for PostgreSQL... ($i/10)"
+          sleep 3
+        done
+        
+    - name: Initialize database
+      run: |
+        python -c "
+        try:
+            from database.models import init_db
+            init_db()
+            print('✅ Database initialized successfully')
+        except Exception as e:
+            print(f'❌ Database initialization failed: {e}')
+            # Try alternative approach
+            from database.db import engine
+            from database.models import Base
+            Base.metadata.create_all(bind=engine)
+            print('✅ Database tables created')
+        "
+        
+    - name: Run learning analysis
+      run: |
+        echo "🧠 Starting learning analysis..."
+        python analyze_learning.py --stats 2>&1
+        
+        # Check if we have enough data to optimize
+        if [ -f "learning_report.json" ]; then
+          echo "📊 Learning report found, applying optimizations..."
+          python apply_optimizations.py 2>&1
+        else
+          echo "📊 No learning report yet, skipping optimization"
+        fi
+        
+    - name: Run bot simulation (data collection)
+      run: |
+        echo "🤖 Starting bot simulation..."
+        
+        # Run bot for 5 cycles (25 minutes with 5-minute intervals)
+        for i in {1..5}; do
+          echo "🔄 Cycle $i/5"
+          
+          # Run single cycle using Python
+          python -c "
+          import sys
+          sys.path.append('.')
+          
+          try:
+              from bot.runner import run_bot_cycle
+              from database.models import init_db
+              
+              # Initialize database connection
+              init_db()
+              
+              # Run one cycle
+              run_bot_cycle()
+              print(f'✅ Cycle {sys.argv[1]} completed')
+          except Exception as e:
+              print(f'⚠️ Error in cycle {sys.argv[1]}: {e}')
+          " $i || true
+          
+          # Wait 5 minutes between cycles
+          if [ $i -lt 5 ]; then
+            echo "⏳ Waiting 5 minutes..."
+            sleep 300
+          fi
+        done
+        
+        echo "✅ Bot simulation completed"
+        
+    - name: Generate final report
+      run: |
+        echo "📈 Generating final analysis..."
+        python analyze_learning.py --stats 2>&1
+        
+        # Show database stats
+        python -c "
+        from database.db import get_session
+        from database.models import Trade
+        
+        session = get_session()
+        try:
+            total = session.query(Trade).count()
+            closed = session.query(Trade).filter(Trade.exit_price != None).count()
+            print(f'📊 Database stats: {total} total trades, {closed} closed')
+        finally:
+            session.close()
+        "
+        
+    - name: Save workflow artifacts
+      if: always()  # Run even if previous steps fail
+      uses: actions/upload-artifact@v3
+      with:
+        name: trader-bot-results
+        path: |
+          learning_report.json
+          optimized_params.json
+          *.png
+          logs/*.log
+        retention-days: 7
+        
+    - name: Upload results to GitHub
+      if: github.event_name != 'schedule'  # Don't auto-push on schedule
+      run: |
+        # Configure git
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # Add generated files
+        git add learning_report.json optimized_params.json *.png 2>/dev/null || true
+        
+        # Commit if there are changes
+        if git diff --quiet && git diff --staged --quiet; then
+          echo "🤷 No changes to commit"
+        else
+          git commit -m "🤖 Automated trading data update"
+          git push
+          echo "✅ Changes pushed to repository"
+        fi
